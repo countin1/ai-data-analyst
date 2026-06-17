@@ -193,6 +193,9 @@ def call_ai_analysis(summary, user_question=None, dimensions=None, model="deepse
     if client is None:
         return "⚠️ API 客户端未配置，请在侧边栏填写 API Key 和 Base URL。"
 
+    if not model or not model.strip():
+        return "⚠️ 请在侧边栏选择或输入模型名称。"
+
     # 构造维度指令
     dim_prompt = ""
     if dimensions:
@@ -206,9 +209,29 @@ def call_ai_analysis(summary, user_question=None, dimensions=None, model="deepse
         }
         dim_prompt = "\n".join([f"- {d}: {dim_map.get(d, '')}" for d in dimensions])
 
-    prompt = f"""你是一位资深数据分析师，擅长从数据中提取业务价值。请根据以下数据摘要，提供专业、深入、可执行的分析报告。
-
-【数据概览】
+    # 宽数据集精简 prompt，避免超 token 上限
+    n_cols = summary['列数']
+    if n_cols > 20:
+        # 只发 top-10 列的统计，分类列最多 5 个
+        numeric_stats = summary.get('数值列统计', {})
+        trimmed_numeric = dict(list(numeric_stats.items())[:10])
+        cat_stats = summary.get('分类列统计', {})
+        trimmed_cat = dict(list(cat_stats.items())[:5])
+        sample_rows = summary.get('前3行样例', [])
+        # 每行只保留 top-10 列
+        if sample_rows and len(sample_rows[0]) > 10:
+            keep_keys = list(trimmed_numeric.keys()) + list(trimmed_cat.keys())
+            sample_rows = [{k: v for k, v in row.items() if k in keep_keys} for row in sample_rows]
+        data_section = f"""【数据概览（宽数据集已精简）】
+- 数据规模: {summary['行数']} 行 × {summary['列数']} 列
+- 数值列 ({len(summary.get('数值列', []))}个): {summary.get('数值列', [])[:10]}{'...' if len(summary.get('数值列', [])) > 10 else ''}
+- 分类列 ({len(summary.get('分类列', []))}个): {summary.get('分类列', [])[:5]}{'...' if len(summary.get('分类列', [])) > 5 else ''}
+- 缺失值: {summary.get('缺失值统计', {})}
+- 数值列统计 (Top 10): {json.dumps(trimmed_numeric, ensure_ascii=False, default=str)}
+- 分类列统计 (Top 5): {json.dumps(trimmed_cat, ensure_ascii=False, default=str)}
+- 样例行: {json.dumps(sample_rows, ensure_ascii=False, default=str)}"""
+    else:
+        data_section = f"""【数据概览】
 - 数据规模: {summary['行数']} 行 × {summary['列数']} 列
 - 数值列 ({len(summary.get('数值列', []))}个): {summary.get('数值列', [])}
 - 分类列 ({len(summary.get('分类列', []))}个): {summary.get('分类列', [])}
@@ -216,7 +239,11 @@ def call_ai_analysis(summary, user_question=None, dimensions=None, model="deepse
 - 缺失值比例(%): {summary.get('缺失值比例', {})}
 - 数值列统计: {json.dumps(summary.get('数值列统计', {}), ensure_ascii=False, default=str)}
 - 分类列统计: {json.dumps(summary.get('分类列统计', {}), ensure_ascii=False, default=str)}
-- 前3行样例: {json.dumps(summary.get('前3行样例', []), ensure_ascii=False, default=str)}
+- 前3行样例: {json.dumps(summary.get('前3行样例', []), ensure_ascii=False, default=str)}"""
+
+    prompt = f"""你是一位资深数据分析师，擅长从数据中提取业务价值。请根据以下数据摘要，提供专业、深入、可执行的分析报告。
+
+{data_section}
 
 请按以下格式输出，每个维度用 ### 标题，内容用编号列表：
 """
@@ -253,11 +280,28 @@ def call_ai_analysis(summary, user_question=None, dimensions=None, model="deepse
             model=model,
             max_tokens=3000,
             temperature=0.7,
+            timeout=60,
             messages=[{"role": "user", "content": prompt}]
         )
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+        # 检查是否被截断
+        if hasattr(response.choices[0], 'finish_reason') and response.choices[0].finish_reason == "length":
+            result += "\n\n⚠️ 注意：报告因 token 上限被截断，建议缩小分析范围或分维度提问。"
+        return result
     except Exception as e:
-        return f"❌ 调用 AI 失败：{str(e)}"
+        import logging
+        logging.exception("AI 分析调用失败")
+        error_msg = str(e)
+        if "rate_limit" in error_msg.lower() or "429" in error_msg:
+            return "❌ 请求过于频繁，请稍后再试。"
+        elif "timeout" in error_msg.lower():
+            return "❌ 请求超时，请稍后重试或减少数据量。"
+        elif "auth" in error_msg.lower() or "401" in error_msg:
+            return "❌ API Key 无效，请检查侧边栏配置。"
+        elif "context_length" in error_msg.lower() or "token" in error_msg.lower():
+            return "❌ 数据量过大超出模型上下文限制，请减少列数或行数后重试。"
+        else:
+            return f"❌ AI 分析失败: {error_msg}"
 
 
 def create_distribution_plots(df, numeric_cols, max_n, theme):
@@ -353,21 +397,41 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
+    # ---- 文件大小检查 ----
+    MAX_FILE_SIZE_MB = 50
+    MAX_ROWS = 100_000
+    file_size_mb = uploaded_file.size / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        st.error(f"❌ 文件过大（{file_size_mb:.1f}MB），上限 {MAX_FILE_SIZE_MB}MB。请裁剪数据后重试。")
+        st.stop()
+
     # ---- 读取文件 ----
     try:
         if uploaded_file.name.endswith('.csv'):
+            last_parser_error = None
             for enc in ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'latin1']:
                 try:
                     uploaded_file.seek(0)
                     df = pd.read_csv(uploaded_file, encoding=enc)
                     break
-                except (UnicodeDecodeError, pd.errors.ParserError):
+                except UnicodeDecodeError:
+                    continue
+                except pd.errors.ParserError as pe:
+                    last_parser_error = pe
                     continue
             else:
-                st.error("无法识别文件编码，请检查文件格式。")
+                if last_parser_error:
+                    st.error(f"CSV 文件格式有误: {last_parser_error}")
+                else:
+                    st.error("无法识别文件编码，请检查文件格式。")
                 st.stop()
         else:
             df = pd.read_excel(uploaded_file)
+
+        if len(df) > MAX_ROWS:
+            st.warning(f"⚠️ 数据行数（{len(df):,}）超过上限 {MAX_ROWS:,}，已截取前 {MAX_ROWS:,} 行进行分析。")
+            df = df.head(MAX_ROWS)
+
         st.success(f"✅ 成功加载 **{uploaded_file.name}** — {df.shape[0]} 行 × {df.shape[1]} 列")
     except Exception as e:
         st.error(f"文件读取失败：{e}")
